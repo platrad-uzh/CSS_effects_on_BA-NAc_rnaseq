@@ -1,0 +1,463 @@
+---
+title: "Data Analysis - Effects of CSS on the transcriptome of BLAa-NAc neurons (no outliers)"
+author: "Gregorio Alanis-Lobato"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+
+library(SummarizedExperiment)
+library(mclust)
+library(enrichR)
+library(pheatmap)
+library(PCAtools)
+library(ggplot2)
+library(ggrepel)
+library(viridis)
+library(patchwork)
+library(DESeq2)
+library(dplyr)
+
+set.seed(42)
+
+```
+
+# Introduction
+
+This report contains the downstream bioinformatics analysis of data from project *1011_CNS_CSS_BA-NAc_reward_neuron_exp_I_Pryce*.
+
+```{r se_construction_expI}
+
+# Retrieve data
+se_full <- readRDS("data/2020_1011_CNS_CSS_BA-NAc_reward_neuron_exp_I_Pryce_SE.rds")
+
+# Remove outliers
+se_full <- se_full[, !se_full$sampleName %in% c("1011_0025")]
+
+# Remove the Amygdala samples
+se_full <- se_full[, !grepl("Amygdala", se_full$MFGroup)]
+
+seq_qc <- readxl::read_excel("data/CSS BA NAc reward neuron exp I Pryce_QC.xls") %>% 
+  dplyr::rename(sampleName = `Sample ID`, quant_ng_uL = `Quant [ng/uL]`,
+                lib_quant_nM = `Library Quant [nM]`, frag_size = `Library Size [bp]`,
+                clust_conc_nM = `Clustering Concentration [nM]`) %>% 
+  dplyr::select(sampleName, quant_ng_uL, lib_quant_nM, frag_size, clust_conc_nM)
+
+# Construct a leaner version of the dataset
+cdata <- as_tibble(colData(se_full)) %>% 
+  dplyr::select(sampleId, sampleName, MFGroup, Sample.ID.TA, RNA.Extraction.Date, 
+                Sample.type) %>% 
+  mutate(MFGroup = case_when(
+    MFGroup == "CSS___CTB_Neuron" ~ "CSS",
+    MFGroup == "Healthy___CTB_Neuron" ~ "Control",
+    MFGroup == "Healthy___Amygdala_without_CTB_Neuron" ~ "Amygdala_without_CTB_Neuron",
+    MFGroup == "Healthy___Amygdala_with_CTB_Neuron" ~ "Amygdala_with_CTB_Neuron"
+    )
+  ) %>% 
+  mutate(MFGroup = factor(MFGroup, levels = c("Control", "CSS", 
+                                              "Amygdala_without_CTB_Neuron",
+                                              "Amygdala_with_CTB_Neuron")))
+cdata <- left_join(cdata, seq_qc, by = "sampleName")
+
+rdata <- as_tibble(rowData(se_full)) %>% 
+  dplyr::select(ensg, symbol, biotype)
+
+mtx <-  assay(se_full, "counts")
+mtx <- mtx[rdata$ensg, cdata$sampleId]
+
+tpm_mtx <- assay(se_full, "tpm")
+tpm_mtx <- tpm_mtx[rdata$ensg, cdata$sampleId]
+
+se_lean <- SummarizedExperiment(assays = list(counts = mtx, 
+                                              tpm = tpm_mtx),
+                                rowData = rdata,
+                                colData = cdata)
+
+```
+
+In this experiment, "reward-sensitive" glutamate neurons were examined to study the short-term effects of chronic social stress (CSS) on the transcriptome of neurons projecting from the anterior part of the medial basal nucleus of the amygdala (BLAa) to the nucleus accumbens (NAc). For this, the NAc of C57BL/6 mice was infused with the cholera toxin beta (CTB) retrograde neuroanatomical tracer. 14 days later, after recovery and tracing, one cohort (CSS mice) were exposed to dominant CD1 mice including brief daily attacks for a time period of 15 days. A second cohort (Control mice) were maintained in brother pairs and handled daily. Following the 15 day time period, the brains of both CSS and CON mice were collected on day 16.
+
+Note that sample **1011_0025** in the *Healthy CTB Neuron* was flagged as problematic given that the labelled cells (CTB Neurons) were considerably more posterior than the rest. This sample was considered an outlier and was removed from the analysis.
+
+The aim of the bioinformatics analysis was to identify genes that are dysregulated in CSS vs Control samples and offer new entry points for pharmacologic control and restoration of typical reward-sensitive behavior in psychiatric disorders such as depression.
+
+# Quality control
+
+## Identification of expressed genes
+
+We identified expressed genes based on the distribution of median expression values across samples. A Gaussian mixture model was fitted to the distribution to identify two clusters and genes whose median expression value belonged to the green cluster (see below) were filtered out from the expression matrix.
+
+```{r gene_filtering}
+# Identify expressed and non-expressed genes via Gaussian mixture model on
+# the median log2 counts  across samples
+median_across_samples <- apply(log2(mtx + 1), 1, median)
+g_mm <- Mclust(median_across_samples, G = 2, verbose = FALSE)
+keep <- which(g_mm$classification == 2)
+
+# Show the model on top of the distribution of medians
+MineICA::plotMix(mc=g_mm, data=median_across_samples, nbBreaks=50)
+```
+
+## Normalisation
+
+Then, we normalised the gene expression matrix using the [variance stabilizing transformation (VST)](https://www.bioconductor.org/packages/devel/workflows/vignettes/rnaseqGene/inst/doc/rnaseqGene.html#the-variance-stabilizing-transformation-and-the-rlog) and identified the 500 highest variable genes (HVGs) for Principal Component Analysis (PCA).
+
+```{r dds_creation}
+# Focus on expressed genes
+se_expr <- se_lean[keep, ]
+
+# Make sure the reference level are the Controls
+se_expr$MFGroup <- relevel(se_expr$MFGroup, "Control")
+
+# DESeq object construction
+dds <- DESeqDataSet(se_expr, design = ~ MFGroup)
+
+# Variance stabilizing transformation
+vsd <-  vst(dds, blind = FALSE)
+
+# Highly variable genes based on highest row variance
+hvg <- head(names(sort(apply(assay(vsd), 1, var), decreasing = T)), 500)
+
+```
+
+## Principal Component Analysis
+
+The following plot shows the data samples in PCA space (PC1 vs PC2) based on the normalised expression matrix and the set of HVGs identified above.
+
+```{r pca1}
+p <- pca(mat = assay(vsd)[hvg, ], metadata = colData(vsd))
+biplot(p,
+       lab = p$metadata$sampleName,
+       colby = "MFGroup",
+       hline = 0, vline = 0,
+       legendPosition = "right",
+       legendLabSize = 9,
+       legendIconSize = 2.5)
+```
+
+This eigencor plot, which shows the correlation of principal components to variable metadata:
+
+```{r ecor1}
+eigencorplot(p,
+             metavars = c("MFGroup", "RNA.Extraction.Date", "quant_ng_uL", 
+                          "lib_quant_nM", "frag_size"),
+             fontLabX = 1.5,
+             fontLabY = 1.5)
+```
+
+## Expression of markers
+
+The following PCA plot shows the level of expression of different cell type markers in each sample:
+
+```{r fig.height=25, fig.width=10}
+mrk <- tibble(marker = c("Snap25", "Slc17a7", "Gad1", "Aqp4", 
+                         "Opalin", "Pdgfra", "Ctss", "Ppp1r1b", "Rspo2"),
+              ensembl = c("ENSMUSG00000027273", "ENSMUSG00000070570", 
+                          "ENSMUSG00000070880", "ENSMUSG00000024411", 
+                          "ENSMUSG00000050121", "ENSMUSG00000029231", 
+                          "ENSMUSG00000038642", "ENSMUSG00000061718", 
+                          "ENSMUSG00000051920"),
+              ctype = c("Neuron", "Glutamate", "GABA", "Astrocyte", 
+                        "Oligodendrocyte", "OPC", "Microglia", "Reward", "Aversion"))
+p_tb <- tibble(PC1 = p$rotated$PC1, 
+               PC2 = p$rotated$PC2, 
+               group = p$metadata$MFGroup)
+p_mrk <- list()
+for(i in 1:nrow(mrk)){
+  p_tb$expr <- assay(vsd)[mrk$ensembl[i], ]
+  p_mrk[[i]] <- ggplot(p_tb, aes(x = PC1, y = PC2, 
+                                 colour = expr, shape = group)) + 
+    geom_point(size = 3) + 
+    scale_colour_viridis(limits = c(0, 18)) +
+    labs(x = paste0("PC1 (", round(p$variance[1], 2), "%)"),
+         y = paste0("PC1 (", round(p$variance[2], 2), "%)"),
+         colour = "VST",
+         title = paste0(mrk$marker[i], " - ", mrk$ctype[i])) +
+    theme_bw()
+}
+p_mrk[[10]] <- guide_area()
+wrap_plots(p_mrk, nrow = 5, ncol = 2) + 
+  plot_layout(guides = "collect")
+
+# RUN TO SAVE THE EXPRESSION OF MARKERS ACROSS SAMPLES
+expr_tb_vst <- as_tibble(colData(se_expr)) %>%
+  dplyr::select(sampleName, MFGroup, Sample.ID.TA)
+expr_tb_tpm <- expr_tb_vst
+
+for(i in 1:nrow(mrk)){
+  varname <- mrk$ensembl[i]
+  expr_tb_vst <- expr_tb_vst %>%
+    mutate(!!paste0(varname, "_", mrk$marker[i]) :=  assay(vsd)[varname, ])
+  expr_tb_tpm <- expr_tb_tpm %>%
+    mutate(!!paste0(varname, "_", mrk$marker[i]) :=  assay(se_expr, "tpm")[varname, ])
+}
+
+expr_tb_vst <- expr_tb_vst %>%
+  arrange(MFGroup)
+
+expr_tb_tpm <- expr_tb_tpm %>%
+  arrange(MFGroup)
+
+readr::write_csv(expr_tb_vst, file = "results/CSS_effects_BLAa-NAc_mrk_VST.csv")
+readr::write_csv(expr_tb_tpm, file = "results/CSS_effects_BLAa-NAc_mrk_TPM.csv")
+
+```
+
+```{r export_tpm}
+# CSS_effects_BLAa-NAc TPM expression table
+tpm_mtx <- assay(se_expr, "tpm")
+colnames(tpm_mtx) <- paste0(se_expr$sampleName, "_", se_expr$MFGroup)
+rownames(tpm_mtx) <- paste0(rowData(se_expr)$ensg, "_", rowData(se_expr)$symbol)
+as_tibble(tpm_mtx, rownames = "gene") %>% 
+  readr::write_csv("results/CSS_effects_BLAa-NAc_TPM.csv")
+```
+
+# Differential gene expression analysis
+
+The following subsections report the results of the differential gene expression analyses between CSS and Control samples for this study. 
+
+## CSS vs Control
+
+The differential gene expression analysis comparing CSS vs Control groups (|log2 fold-change| > 0, FDR < 10%), leads to the following results:
+
+
+```{r dgea_expI}
+dds <- DESeq(dds)
+res <- results(dds, lfcThreshold = 0, alpha = 0.1)
+summary(res)
+```
+
+The following table lists the results of this analysis sorted by FDR (`padj`). Only genes with raw p-values < 0.1 are included:
+
+
+```{r tb_dgea_expI}
+res_expI <- as_tibble(res, rownames = "ensg") %>% 
+  left_join(as_tibble(rowData(se_expr)), by = "ensg") %>% 
+  dplyr::select(ensg, symbol, baseMean, log2FoldChange, pvalue, padj) %>%
+  dplyr::rename(logFC = log2FoldChange,
+                avgExpr = baseMean) %>% 
+  filter(pvalue < 0.1) %>% 
+  arrange(padj, pvalue, desc(logFC))
+
+DT::datatable(res_expI,
+              extensions = "Buttons", 
+              options = list(dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "CSS_effects_BLAa-NAc_dgea")
+                                            )
+                             )
+              ) %>% 
+  DT::formatRound("logFC", 3) %>% 
+  DT::formatSignif("pvalue", 3) %>% 
+  DT::formatSignif("padj", 3) %>% 
+  DT::formatRound("avgExpr", 3)
+```
+
+
+
+# Functional enrichment analysis
+
+The following subsections report the results of the functional enrichment analyses carried out with lists of genes extracted from the above table. Gene inclusion in the analyses was based on the thresholds specified in the titles of each subsection. Note that this doesn't mean that differential expression analysis was re-run with these thresholds but that the above table were filtered with them.
+
+## CSS vs Control (|log2 fold-change| > 0.5, p < 0.001)
+
+- `r sum(filter(res_expI, abs(logFC) > 0.5 & pvalue < 0.001)$logFC > 0)` up-regulated genes.
+- `r sum(filter(res_expI, abs(logFC) > 0.5 & pvalue < 0.001)$logFC < 0)` down-regulated genes.
+
+```{r fea_expI_cutoff1}
+sig_genes <- res_expI %>% 
+  filter(abs(logFC) > 0.5 & pvalue < 0.001) %>%
+  pull(symbol)
+
+out_enrichr <- enrichr(sig_genes,
+                       databases = c("KEGG_2019_Mouse", 
+                      "GO_Biological_Process_2018", 
+                      "GO_Molecular_Function_2018", 
+                      "Reactome_2016"))
+```
+
+### GO Biological Process
+
+```{r bp_expI_cutoff1}
+DT::datatable(subset(out_enrichr$GO_Biological_Process_2018[, c("Term",
+                                                                "Adjusted.P.value", 
+                                                                "Overlap", 
+                                                                "Genes")], 
+                     subset = Adjusted.P.value <= 0.1),
+              extensions = "Buttons", 
+              options = list(dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "bp_fc05p001_CSS_effects_BLAa-NAc")
+                                            )
+                             )
+              ) %>% 
+  DT::formatSignif("Adjusted.P.value", 3)
+```
+
+### GO Molecular Function
+
+```{r mf_expI_cutoff1}
+DT::datatable(subset(out_enrichr$GO_Molecular_Function_2018[, c("Term",
+                                                                "Adjusted.P.value", 
+                                                                "Overlap", 
+                                                                "Genes")], 
+                     subset = Adjusted.P.value <= 0.1),
+              extensions = "Buttons", 
+              options = list(dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "mf_fc05p001_CSS_effects_BLAa-NAc")
+                                            )
+                             )
+              ) %>% 
+  DT::formatSignif("Adjusted.P.value", 3)
+```
+
+### KEGG
+
+```{r kegg_expI_cutoff1}
+DT::datatable(subset(out_enrichr$KEGG_2019_Mouse[, c("Term",
+                                                     "Adjusted.P.value", 
+                                                     "Overlap", 
+                                                     "Genes")], 
+                     subset = Adjusted.P.value <= 0.1),
+              extensions = "Buttons", 
+              options = list(dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "kegg_expI")
+                                            )
+                             )
+              ) %>% 
+  DT::formatSignif("Adjusted.P.value", 3)
+```
+
+### Reactome
+
+```{r reac_expI_cutoff1}
+DT::datatable(subset(out_enrichr$Reactome_2016[, c("Term",
+                                                   "Adjusted.P.value", 
+                                                   "Overlap",
+                                                   "Genes")], 
+                     subset = Adjusted.P.value <= 0.1),
+              extensions = "Buttons", 
+              options = list(dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "react_fc05p001_CSS_effects_BLAa-NAc")
+                                            )
+                             )
+              ) %>% 
+  DT::formatSignif("Adjusted.P.value", 3)
+```
+
+## CSS vs Control (|log2 fold-change| > 0.5, p < 0.01)
+
+- `r sum(filter(res_expI, abs(logFC) > 0.5 & pvalue < 0.01)$logFC > 0)` up-regulated genes.
+- `r sum(filter(res_expI, abs(logFC) > 0.5 & pvalue < 0.01)$logFC < 0)` down-regulated genes.
+
+```{r fea_expI_cutoff2}
+sig_genes <- res_expI %>% 
+  filter(abs(logFC) > 0.5 & pvalue < 0.01) %>%
+  pull(symbol)
+
+out_enrichr <- enrichr(sig_genes,
+                       databases = c("KEGG_2019_Mouse", 
+                      "GO_Biological_Process_2018", 
+                      "GO_Molecular_Function_2018", 
+                      "Reactome_2016"))
+```
+
+### GO Biological Process
+
+```{r bp_expI_cutoff2}
+DT::datatable(subset(out_enrichr$GO_Biological_Process_2018[, c("Term",
+                                                                "Adjusted.P.value", 
+                                                                "Overlap", 
+                                                                "Genes")], 
+                     subset = Adjusted.P.value <= 0.1),
+              extensions = "Buttons", 
+              options = list(dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "bp_fc05p01_CSS_effects_BLAa-NAc")
+                                            )
+                             )
+              ) %>% 
+  DT::formatSignif("Adjusted.P.value", 3)
+```
+
+### GO Molecular Function
+
+```{r mf_expI_cutoff2}
+DT::datatable(subset(out_enrichr$GO_Molecular_Function_2018[, c("Term",
+                                                                "Adjusted.P.value", 
+                                                                "Overlap", 
+                                                                "Genes")], 
+                     subset = Adjusted.P.value <= 0.1),
+              extensions = "Buttons", 
+              options = list(dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "mf_bp_fc05p01_CSS_effects_BLAa-NAc")
+                                            )
+                             )
+              ) %>% 
+  DT::formatSignif("Adjusted.P.value", 3)
+```
+
+### KEGG
+
+```{r kegg_expI_cutoff2}
+DT::datatable(subset(out_enrichr$KEGG_2019_Mouse[, c("Term",
+                                                     "Adjusted.P.value", 
+                                                     "Overlap", 
+                                                     "Genes")], 
+                     subset = Adjusted.P.value <= 0.1),
+              extensions = "Buttons", 
+              options = list(dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "kegg_bp_fc05p01_CSS_effects_BLAa-NAc")
+                                            )
+                             )
+              ) %>% 
+  DT::formatSignif("Adjusted.P.value", 3)
+```
+
+### Reactome
+
+```{r reac_expI_cutoff2}
+DT::datatable(subset(out_enrichr$Reactome_2016[, c("Term",
+                                                   "Adjusted.P.value", 
+                                                   "Overlap",
+                                                   "Genes")], 
+                     subset = Adjusted.P.value <= 0.1),
+              extensions = "Buttons", 
+              options = list(dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "react_bp_fc05p01_CSS_effects_BLAa-NAc")
+                                            )
+                             )
+              ) %>% 
+  DT::formatSignif("Adjusted.P.value", 3)
+```
+
+# Saving the resulting data
+
+This is a place-holder section with code to save the main results of this analysis as an `RData` file.
+
+```{r save_expI}
+save(se_lean, se_expr, dds, vsd, res_expI, file = "results/CSS_effects_BLAa-NAc.RData")
+```
+

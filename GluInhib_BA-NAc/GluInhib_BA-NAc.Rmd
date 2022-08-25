@@ -1,0 +1,525 @@
+---
+title: "Data Analysis - Glutamate-inhibition effects on the transcriptome of BLAa-NAc neurons"
+author: "Gregorio Alanis-Lobato"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+
+library(SummarizedExperiment)
+library(mclust)
+library(enrichR)
+library(pheatmap)
+library(PCAtools)
+library(ggplot2)
+library(ggrepel)
+library(viridis)
+library(patchwork)
+library(DESeq2)
+library(dplyr)
+
+set.seed(42)
+
+```
+
+# Introduction
+
+This report contains the downstream bioinformatics analysis of data from project *1055_CNS_CSS_BA-NAc_reward_neuron_exp_III_Pryce*.
+
+```{r raw_data}
+
+# Retrieve data
+se_full <- readRDS("data/2021_1055_CNS_CSS_BA-NAc_reward_neuron_exp_III_Pryce_SE.rds")
+
+seq_qc <- readxl::read_excel("data/CSS BA-NAc reward neuron exp III Pryce_QC.xls") %>% 
+  dplyr::rename(sampleName = `Sample ID`, quant_ng_uL = `Quant [ng/uL]`,
+                lib_quant_nM = `Library Quant [nM]`, lib_size = `Library Size [bp]`,
+                clust_conc_nM = `Clustering Concentration [nM]`) %>% 
+  dplyr::select(sampleName, quant_ng_uL, lib_quant_nM, lib_size, clust_conc_nM)
+```
+
+```{r se_construction}
+# Construct a leaner version of the dataset
+cdata <- as_tibble(colData(se_full)) %>% 
+  dplyr::select(sampleId, sampleName, MFGroup, Sample.ID.TA, RNA.Extraction.Date, 
+                Cell.count, X..of.sections, Comment_1) %>% 
+  mutate(MFGroup = factor(MFGroup, levels = c("Control", "Cre")))
+cdata <- left_join(cdata, seq_qc, by = "sampleName")
+
+rdata <- as_tibble(rowData(se_full)) %>% 
+  dplyr::select(ensg, symbol, biotype)
+
+mtx <-  assay(se_full, "counts")
+mtx <- mtx[rdata$ensg, cdata$sampleId]
+
+tpm_mtx <- assay(se_full, "tpm")
+tpm_mtx <- tpm_mtx[rdata$ensg, cdata$sampleId]
+
+se_lean <- SummarizedExperiment(assays = list(counts = mtx, 
+                                              tpm = tpm_mtx),
+                                rowData = rdata,
+                                colData = cdata)
+```
+
+The experiment was a follow-up of projects *1011_CNS_CSS_BA-NAc_reward_neuron_exp_I_Pryce* and *1054_CNS_CSS_BA-NAc_reward_neuron_exp_II_Pryce*, where "reward-sensitive" glutamate neurons were examined to study the short and long term effects of chronic social stress (CSS) on the transcriptome of neurons projecting from the medial basal nucleus of the amygdala (BA) to the nucleus accumbens (NAc). 
+
+The **focus of this *in vivo* experiment** was to **assess the effects of glutamate neurotransmission inhibition on the transcriptome of the BA-NAc "reward-sensitive" glutamatergic neurons**. For this, the BA of N=6 mice was infused with an AAV vector for floxed tetanus toxin light chain (TeTxLC) and their NAc with a Cre recombinase-expressing retrograde AAV vector. TeTxLC expression resulted in cleavage of the vesicle-associated membrane protein 2 (VAMP2), causing reduction of the vesicular glutamate release in the BA neurons projecting to the NAc. Control mice (N=6) were infused with the floxed TeTxLC vector in the BA, but only with a non-Cre expressing control vector in the NAc. Samples were collected 15 days after infusion. The hypothesis is that glutamate neurotransmission inhibition doesn't have an effect on gene expression and that the observed behavioural outcomes are entirely due to cleavage of VAMP2.
+
+The aim of the bioinformatics analysis was to identify genes that are dysregulated in Cre vs Control samples and identify the biological processes in which they're involved.
+
+# Notes about sample quality
+
+The GCBDS Genomics Lab flagged Control sample *LM_2.1_2.2_2.3 (1055_0002)* as a potential outlier because its RNA QC showed higher concentration than expected (10 times higher). Although *1055_0002* was diluted to the appropriate normalised input amount as the rest of the samples (ca. 1ng RNA input), its post-sequencing QC showed higher yield and mapping to coding regions, as well as lower duplication rate.
+
+```{r rna_conc}
+cdata %>% 
+  mutate(lbl = ifelse(sampleName == "1055_0002", sampleName, "")) %>% 
+  ggplot(aes(x = "Project 1054", y = quant_ng_uL, label = lbl)) + 
+  ggbeeswarm::geom_quasirandom(width = 0.25) +
+  geom_text_repel() +
+  labs(x = "", y = "RNA Concentration (ng/uL)") +
+  theme_bw()
+```
+
+# Quality control
+
+## Identification of expressed genes
+
+We identified expressed genes based on the distribution of median expression values across samples. A Gaussian mixture model was fitted to the distribution to identify two clusters and genes whose median expression value belonged to the green cluster (see below) were filtered out from the expression matrix.
+
+```{r gene_filtering}
+# Identify expressed and non-expressed genes via Gaussian mixture model on
+# the median log2 counts  across samples
+median_across_samples <- apply(log2(mtx + 1), 1, median)
+g_mm <- Mclust(median_across_samples, G = 2, verbose = FALSE)
+keep <- which(g_mm$classification == 2)
+
+# Show the model on top of the distribution of medians
+MineICA::plotMix(mc=g_mm, data=median_across_samples, nbBreaks=50)
+```
+
+## Normalisation
+
+Then, we normalised the gene expression matrix using the [variance stabilizing transformation (VST)](https://www.bioconductor.org/packages/devel/workflows/vignettes/rnaseqGene/inst/doc/rnaseqGene.html#the-variance-stabilizing-transformation-and-the-rlog) and identified the 500 highest variable genes (HVGs) for Principal Component Analysis (PCA).
+
+```{r dds_creation}
+# Focus on expressed genes
+se_expr <- se_lean[keep, ]
+
+# Make sure the reference level are the Controls
+se_expr$MFGroup <- relevel(se_expr$MFGroup, "Control")
+
+# DESeq object construction
+dds <- DESeqDataSet(se_expr, design = ~ MFGroup)
+
+# Variance stabilizing transformation
+vsd <-  vst(dds, blind = FALSE)
+
+# Highly variable genes based on highest row variance
+hvg <- head(names(sort(apply(assay(vsd), 1, var), decreasing = T)), 500)
+
+```
+
+## Principal Component Analysis
+
+The following plot shows the data samples in PCA space (PC1 vs PC2) based on the normalised expression matrix and the set of HVGs identified above.
+
+```{r pca1}
+p <- pca(mat = assay(vsd)[hvg, ], metadata = colData(vsd))
+biplot(p,
+       lab = p$metadata$sampleName,
+       colby = "MFGroup",
+       hline = 0, vline = 0,
+       legendPosition = "right",
+       legendLabSize = 9,
+       legendIconSize = 2.5)
+```
+
+The PCA plot shows, as expected, that sample *1055_0002* separates from the rest of the data due to its high RNA concentration, yield and low duplication rate. This is further confirmed by an eigencor plot, which shows the correlation of principal components to variable metadata.
+
+```{r ecor1}
+eigencorplot(p,
+             metavars = c("MFGroup", "Cell.count", "X..of.sections", 
+                          "quant_ng_uL", "lib_quant_nM", 
+                          "lib_size"),
+             fontLabX = 1.5,
+             fontLabY = 1.5)
+```
+
+The eigencor plot highlights the strong and significant positive correlation between PC2 and variables *lib_quant_nM* and *quant_ng_uL*. Therefore, we decided to remove this sample for further analyses.
+
+
+## Identification of expressed genes after outlier removal
+
+Using the same strategy as above, we identified the set of expressed genes after outlier removal.
+
+```{r rm_outlier}
+# Remove outliers
+se_rmout <- se_lean[, se_lean$sampleName != "1055_0002"]
+
+# Identify expressed and non-expressed genes via Gaussian mixture model on
+# the median log2 counts  across samples
+median_across_samples <- apply(log2(assay(se_rmout, "counts") + 1), 1, median)
+g_mm <- Mclust(median_across_samples, G = 2, verbose = FALSE)
+keep <- which(g_mm$classification == 2)
+
+# Show the model on top of the distribution of medians
+MineICA::plotMix(mc=g_mm, data=median_across_samples, nbBreaks=50)
+```
+
+## Normalisation after outlier removal
+
+Then we re-normalised the dataset and determined the set of HVGs.
+
+```{r dds_creation2}
+# Focus on expressed genes
+se_expr <- se_rmout[keep, ]
+
+# Make sure the reference level are the Controls
+se_expr$MFGroup <- relevel(se_expr$MFGroup, "Control")
+
+# DESeq object construction
+dds <- DESeqDataSet(se_expr, design = ~ MFGroup)
+
+# Variance stabilizing transformation
+vsd <-  vst(dds, blind = FALSE)
+
+# Highly variable genes based on highest row variance
+hvg <- head(names(sort(apply(assay(vsd), 1, var), decreasing = T)), 500)
+```
+
+## PCA after outlier removal
+
+The following PCA plot shows that removal of sample *1055_0002* improves the visualisation of sample-sample relationships:
+
+```{r pca2}
+p <- pca(mat = assay(vsd)[hvg, ], metadata = colData(vsd))
+biplot(p,
+       lab = p$metadata$sampleName,
+       colby = "MFGroup",
+       hline = 0, vline = 0,
+       legendPosition = "right",
+       legendLabSize = 9,
+       legendIconSize = 2.5)
+```
+
+This time, the eigencor plot doesn't show any significant correlation between sample metadata and principal components. Except for the variable containing the contrast of interest *MFGroup*.
+
+```{r ecor2}
+eigencorplot(p,
+             metavars = c("MFGroup", "Cell.count", "X..of.sections", 
+                          "quant_ng_uL", "lib_quant_nM", 
+                          "lib_size"),
+             fontLabX = 1.5,
+             fontLabY = 1.5)
+```
+
+## Expression of markers
+
+The following PCA plot shows the level of expression of different cell type markers in each sample:
+
+```{r fig.height=25, fig.width=10}
+mrk <- tibble(marker = c("Snap25", "Slc17a7", "Gad1", "Aqp4", 
+                         "Opalin", "Pdgfra", "Ctss", "Ppp1r1b", "Rspo2"),
+              ensembl = c("ENSMUSG00000027273", "ENSMUSG00000070570", 
+                          "ENSMUSG00000070880", "ENSMUSG00000024411", 
+                          "ENSMUSG00000050121", "ENSMUSG00000029231", 
+                          "ENSMUSG00000038642", "ENSMUSG00000061718", 
+                          "ENSMUSG00000051920"),
+              ctype = c("Neuron", "Glutamate", "GABA", "Astrocyte", 
+                        "Oligodendrocyte", "OPC", "Microglia", "Reward", "Aversion"))
+p_tb <- tibble(PC1 = p$rotated$PC1, 
+               PC2 = p$rotated$PC2, 
+               group = p$metadata$MFGroup)
+p_mrk <- list()
+for(i in 1:nrow(mrk)){
+  p_tb$expr <- assay(vsd)[mrk$ensembl[i], ]
+  p_mrk[[i]] <- ggplot(p_tb, aes(x = PC1, y = PC2, 
+                                 colour = expr, shape = group)) + 
+    geom_point(size = 3) + 
+    scale_colour_viridis(limits = c(0, 18)) +
+    labs(x = paste0("PC1 (", round(p$variance[1], 2), "%)"),
+         y = paste0("PC1 (", round(p$variance[2], 2), "%)"),
+         colour = "VST",
+         title = paste0(mrk$marker[i], " - ", mrk$ctype[i])) +
+    theme_bw()
+}
+p_mrk[[10]] <- guide_area()
+wrap_plots(p_mrk, nrow = 5, ncol = 2) + 
+  plot_layout(guides = "collect")
+
+# RUN TO SAVE THE EXPRESSION OF MARKERS ACROSS SAMPLES
+expr_tb_vst <- as_tibble(colData(se_expr)) %>% 
+  dplyr::select(sampleName, MFGroup, Sample.ID.TA)
+expr_tb_tpm <- expr_tb_vst
+
+for(i in 1:nrow(mrk)){
+  varname <- mrk$ensembl[i]
+  expr_tb_vst <- expr_tb_vst %>%
+    mutate(!!paste0(varname, "_", mrk$marker[i]) :=  assay(vsd)[varname, ])
+  expr_tb_tpm <- expr_tb_tpm %>%
+    mutate(!!paste0(varname, "_", mrk$marker[i]) :=  assay(se_expr, "tpm")[varname, ])
+}
+
+expr_tb_vst <- expr_tb_vst %>%
+  arrange(MFGroup)
+
+expr_tb_tpm <- expr_tb_tpm %>%
+  arrange(MFGroup)
+
+readr::write_csv(expr_tb_vst, file = "results/GluInhib_BLAa-NAc_mrk_VST.csv")
+readr::write_csv(expr_tb_tpm, file = "results/GluInhib_BLAa-NAc_mrk_TPM.csv")
+
+```
+
+```{r export_tpm}
+# GluInhib_BLAa-NAc TPM expression table
+tpm_mtx <- assay(se_expr, "tpm")
+colnames(tpm_mtx) <- paste0(se_expr$sampleName, "_", se_expr$MFGroup)
+rownames(tpm_mtx) <- paste0(rowData(se_expr)$ensg, "_", rowData(se_expr)$symbol)
+as_tibble(tpm_mtx, rownames = "gene") %>% 
+  readr::write_csv("results/GluInhib_BLAa-NAc_TPM.csv")
+```
+
+
+# Differential gene expression analysis
+
+## Cre vs Control
+
+The differential gene expression analysis comparing Cre vs Control groups led to 317 up-regulated and 46 down-regulated genes (|log2 fold-change| > 0 FDR < 10%). 
+
+```{r dgea_mfgroup}
+dds <- DESeq(dds)
+res <- results(dds)
+summary(res)
+```
+
+The following table lists the results of this analysis sorted by FDR (`padj`). Only genes with raw p-values < 0.05 are included:
+
+```{r tb_mfgroup}
+res_mfgroup <- as_tibble(res, rownames = "ensg") %>% 
+  left_join(as_tibble(rowData(se_expr)), by = "ensg") %>% 
+  dplyr::select(ensg, symbol, baseMean, log2FoldChange, pvalue, padj) %>%
+  dplyr::rename(logFC = log2FoldChange,
+                avgExpr = baseMean) %>% 
+  filter(pvalue < 0.05) %>% 
+  arrange(padj, pvalue, desc(logFC))
+
+DT::datatable(res_mfgroup,
+              extensions = "Buttons", 
+              options = list(dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "GluInhib_BLAa-NAc_dgea")
+                                            )
+                             )
+              ) %>% 
+  DT::formatRound("logFC", 3) %>% 
+  DT::formatSignif("pvalue", 3) %>% 
+  DT::formatSignif("padj", 3) %>% 
+  DT::formatRound("avgExpr", 3)
+```
+
+
+# Functional enrichment analysis
+
+## Cre vs Control (|log2 fold-change| > 0, FDR < 0.1)
+
+- `r sum(filter(res_mfgroup, abs(logFC) > 0 & padj < 0.1)$logFC > 0)` up-regulated genes.
+- `r sum(filter(res_mfgroup, abs(logFC) > 0 & padj < 0.1)$logFC < 0)` down-regulated genes.
+
+```{r fea_cssg}
+sig_genes <- res_mfgroup$symbol[res_mfgroup$padj < 0.1]
+
+out_enrichr <- enrichr(sig_genes,
+                       databases = c("KEGG_2019_Mouse", 
+                      "GO_Biological_Process_2018", 
+                      "GO_Molecular_Function_2018", 
+                      "Reactome_2016"))
+
+```
+
+### GO Biological Process
+
+```{r bp_cssg}
+DT::datatable(subset(out_enrichr$GO_Biological_Process_2018[, c("Term",
+                                                                "Adjusted.P.value", 
+                                                                "Overlap", 
+                                                                "Genes")], 
+                     subset = Adjusted.P.value <= 0.1),
+              extensions = "Buttons", 
+              options = list(dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "bp_fc0fdr01_GluInhib_BLAa-NAc")
+                                            )
+                             )
+              ) %>% 
+  DT::formatSignif("Adjusted.P.value", 3)
+```
+
+### GO Molecular Function
+
+```{r mf_cssg}
+DT::datatable(subset(out_enrichr$GO_Molecular_Function_2018[, c("Term",
+                                                                "Adjusted.P.value", 
+                                                                "Overlap", 
+                                                                "Genes")], 
+                     subset = Adjusted.P.value <= 0.1),
+              extensions = "Buttons", 
+              options = list(dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "mf_fc0fdr01_GluInhib_BLAa-NAc")
+                                            )
+                             )
+              ) %>% 
+  DT::formatSignif("Adjusted.P.value", 3)
+```
+
+### KEGG
+
+```{r kegg_cssg}
+DT::datatable(subset(out_enrichr$KEGG_2019_Mouse[, c("Term",
+                                                     "Adjusted.P.value", 
+                                                     "Overlap", 
+                                                     "Genes")], 
+                     subset = Adjusted.P.value <= 0.1),
+              extensions = "Buttons", 
+              options = list(dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "kegg_fc0fdr01_GluInhib_BLAa-NAc")
+                                            )
+                             )
+              ) %>% 
+  DT::formatSignif("Adjusted.P.value", 3)
+```
+
+### Reactome
+
+```{r reac_cssg}
+DT::datatable(subset(out_enrichr$Reactome_2016[, c("Term",
+                                                   "Adjusted.P.value", 
+                                                   "Overlap",
+                                                   "Genes")], 
+                     subset = Adjusted.P.value <= 0.1),
+              extensions = "Buttons", 
+              options = list(dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "react_fc0fdr01_GluInhib_BLAa-NAc")
+                                            )
+                             )
+              ) %>% 
+  DT::formatSignif("Adjusted.P.value", 3)
+```
+
+## Cre vs Control (|log2 fold-change| > 0.5, p-value < 0.001)
+
+- `r sum(filter(res_mfgroup, abs(logFC) > 0.5 & pvalue < 0.001)$logFC > 0)` up-regulated genes.
+- `r sum(filter(res_mfgroup, abs(logFC) > 0.5 & pvalue < 0.001)$logFC < 0)` down-regulated genes.
+
+```{r fea_cssg2}
+sig_genes <- res_mfgroup %>% 
+  filter(abs(logFC) > 0.5 & pvalue < 0.001) %>%
+  pull(symbol)
+
+out_enrichr <- enrichr(sig_genes,
+                       databases = c("KEGG_2019_Mouse", 
+                      "GO_Biological_Process_2018", 
+                      "GO_Molecular_Function_2018", 
+                      "Reactome_2016"))
+
+```
+
+### GO Biological Process
+
+```{r bp_cssg2}
+DT::datatable(subset(out_enrichr$GO_Biological_Process_2018[, c("Term",
+                                                                "Adjusted.P.value", 
+                                                                "Overlap", 
+                                                                "Genes")], 
+                     subset = Adjusted.P.value <= 0.1),
+              extensions = "Buttons", 
+              options = list(dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "bp_fc05p001_GluInhib_BLAa-NAc")
+                                            )
+                             )
+              ) %>% 
+  DT::formatSignif("Adjusted.P.value", 3)
+```
+
+### GO Molecular Function
+
+```{r mf_cssg2}
+DT::datatable(subset(out_enrichr$GO_Molecular_Function_2018[, c("Term",
+                                                                "Adjusted.P.value", 
+                                                                "Overlap", 
+                                                                "Genes")], 
+                     subset = Adjusted.P.value <= 0.1),
+              extensions = "Buttons", 
+              options = list(dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "mf_fc05p001_GluInhib_BLAa-NAc")
+                                            )
+                             )
+              ) %>% 
+  DT::formatSignif("Adjusted.P.value", 3)
+```
+
+### KEGG
+
+```{r kegg_cssg2}
+DT::datatable(subset(out_enrichr$KEGG_2019_Mouse[, c("Term",
+                                                     "Adjusted.P.value", 
+                                                     "Overlap", 
+                                                     "Genes")], 
+                     subset = Adjusted.P.value <= 0.1),
+              extensions = "Buttons", 
+              options = list(dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "kegg_fc05p001_GluInhib_BLAa-NAc")
+                                            )
+                             )
+              ) %>% 
+  DT::formatSignif("Adjusted.P.value", 3)
+```
+
+### Reactome
+
+```{r reac_cssg2}
+DT::datatable(subset(out_enrichr$Reactome_2016[, c("Term",
+                                                   "Adjusted.P.value", 
+                                                   "Overlap",
+                                                   "Genes")], 
+                     subset = Adjusted.P.value <= 0.1),
+              extensions = "Buttons", 
+              options = list(dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "react_fc05p001_GluInhib_BLAa-NAc")
+                                            )
+                             )
+              ) %>% 
+  DT::formatSignif("Adjusted.P.value", 3)
+```
+
+# Saving the resulting data
+
+This is a place-holder section with code to save the main results of this analysis as an `RData` file.
+
+```{r save_expI}
+save(se_lean, se_expr, dds, vsd, res_mfgroup, file = "results/GluInhib_BLAa-NAc.RData")
+```

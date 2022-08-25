@@ -1,3 +1,4 @@
 .Rhistory
-.rds
-.RData
+.DS_Store
+*.html
+*.RData
